@@ -1,0 +1,584 @@
+name: GitOps Required Check
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitops-required-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitops-required-check:
+    name: gitops-required-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate event, revision, and changed paths
+        id: policy
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login || '' }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type || '' }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+
+          readonly manifest_path='apps/demo/deployment.yaml'
+          readonly workflow_path='.github/workflows/gitops-required-check.yml'
+          readonly expected_app_bot='cloudops-incident-agent-v3[bot]'
+          readonly cloudops_branch_pattern='^cloudops/incident-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/plan-[0-9a-f]{12,64}$'
+          readonly maintenance_branch_pattern='^maintenance/demo-[a-z0-9][a-z0-9-]{0,40}$'
+          readonly regression_branch_pattern='^regression/required-env-[a-z0-9][a-z0-9-]{0,40}$'
+
+          fail() {
+            printf 'policy violation: %s\n' "$*" >&2
+            exit 1
+          }
+
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_SHA" ]] || fail 'checkout does not match the event SHA'
+
+          inspect_head_path() {
+            local path=$1 tree_entry metadata mode object_type object_id size
+            [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "unsafe path characters: $path"
+            tree_entry=$(git ls-tree "$EXPECTED_SHA" -- "$path")
+            [[ -n "$tree_entry" ]] || fail "path is absent from the head tree: $path"
+            metadata=${tree_entry%%$'\t'*}
+            IFS=' ' read -r mode object_type object_id <<<"$metadata"
+            [[ "$mode" == '100644' && "$object_type" == 'blob' ]] || fail "path must be a regular non-executable file: $path"
+            size=$(git cat-file -s "$object_id")
+            (( size <= 65536 )) || fail "file exceeds 64 KiB: $path"
+          }
+
+          validate_head_tree() {
+            local path
+            mapfile -d '' -t tracked_paths < <(git ls-tree -r --name-only -z "$EXPECTED_SHA")
+            (( ${#tracked_paths[@]} <= 18 )) || fail 'repository contains too many tracked files'
+            for path in "${tracked_paths[@]}"; do
+              case "$path" in
+                README.md|"$workflow_path"|apps/demo/*.yaml|apps/demo/*.yml)
+                  inspect_head_path "$path"
+                  ;;
+                *)
+                  fail "tracked path is outside the GitOps allowlist: $path"
+                  ;;
+              esac
+            done
+          }
+
+          require_reviewable_author() {
+            if [[ "${PR_AUTHOR,,}" == "${REPOSITORY_OWNER,,}" ]]; then
+              return 0
+            fi
+            [[ "$PR_AUTHOR" == "$expected_app_bot" && "$PR_AUTHOR_TYPE" == 'Bot' ]] || fail 'branch must be opened by the repository owner or the configured GitHub App'
+          }
+
+          require_only_app_paths() {
+            local path
+            for path in "${changed_paths[@]}"; do
+              [[ "$path" == apps/demo/*.yaml || "$path" == apps/demo/*.yml ]] || fail "branch may change only apps/demo YAML: $path"
+            done
+          }
+
+          contains_changed_path() {
+            local expected=$1 candidate
+            for candidate in "${changed_paths[@]}"; do
+              [[ "$candidate" == "$expected" ]] && return 0
+            done
+            return 1
+          }
+
+          if [[ "$EVENT_NAME" == 'workflow_dispatch' ]]; then
+            [[ "$WORKFLOW_REF" == 'refs/heads/main' ]] || fail 'manual validation is allowed only on main'
+            validate_head_tree
+
+            if [[ ! -e "$manifest_path" ]]; then
+              mapfile -d '' -t bootstrap_paths < <(git ls-tree -r --name-only -z "$EXPECTED_SHA" | sort -z)
+              [[ ${#bootstrap_paths[@]} -eq 2 ]] || fail 'manifest-less bootstrap tree must contain exactly two files'
+              [[ "${bootstrap_paths[0]}" == "$workflow_path" ]] || fail 'bootstrap tree is missing the fixed workflow'
+              [[ "${bootstrap_paths[1]}" == 'README.md' ]] || fail 'bootstrap tree is missing README.md'
+              printf 'mode=bootstrap\n' >>"$GITHUB_OUTPUT"
+              printf 'base_sha=\n' >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            [[ -f "$manifest_path" ]] || fail 'deployment manifest is not a regular file'
+            printf 'mode=tree\n' >>"$GITHUB_OUTPUT"
+            printf 'base_sha=\n' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          [[ "$EVENT_NAME" == 'pull_request' ]] || fail "unsupported event: $EVENT_NAME"
+          [[ "$BASE_REF" == 'main' ]] || fail 'pull request base must be main'
+          [[ "$HEAD_REPOSITORY" == "$REPOSITORY" ]] || fail 'fork pull requests are not accepted'
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'invalid base SHA'
+          git cat-file -e "${BASE_SHA}^{commit}" || fail 'base commit is unavailable'
+          validate_head_tree
+
+          mapfile -d '' -t diff_items < <(git diff --name-status -z --no-renames "$BASE_SHA" "$EXPECTED_SHA")
+          (( ${#diff_items[@]} >= 2 )) || fail 'pull request has no changed files'
+          (( ${#diff_items[@]} % 2 == 0 )) || fail 'unexpected diff encoding'
+          (( ${#diff_items[@]} <= 32 )) || fail 'pull request changes more than 16 files'
+
+          diff_bytes=$(git diff --binary --no-renames "$BASE_SHA" "$EXPECTED_SHA" -- | wc -c)
+          (( diff_bytes <= 262144 )) || fail 'pull request diff exceeds 256 KiB'
+
+          changed_paths=()
+          for ((index = 0; index < ${#diff_items[@]}; index += 2)); do
+            status=${diff_items[index]}
+            path=${diff_items[index + 1]}
+            [[ "$status" == 'A' || "$status" == 'M' ]] || fail "only added or modified files are allowed: $path"
+            case "$path" in
+              README.md|"$workflow_path") ;;
+              apps/demo/*.yaml|apps/demo/*.yml)
+                ;;
+              *)
+                fail "changed path is outside the GitOps allowlist: $path"
+                ;;
+            esac
+            inspect_head_path "$path"
+            changed_paths+=("$path")
+          done
+
+          if [[ "$HEAD_REF" == 'codex/bootstrap-required-check' ]]; then
+            require_reviewable_author
+            (( ${#changed_paths[@]} == 1 )) || fail 'workflow bootstrap must change exactly one file'
+            [[ "${changed_paths[0]}" == "$workflow_path" && "${diff_items[0]}" == 'A' ]] || fail 'workflow bootstrap may only add the fixed workflow'
+            if git cat-file -e "${BASE_SHA}:${workflow_path}" 2>/dev/null; then
+              fail 'workflow bootstrap is allowed only when the base has no workflow'
+            fi
+            printf 'mode=bootstrap\n' >>"$GITHUB_OUTPUT"
+          elif [[ "$HEAD_REF" =~ $cloudops_branch_pattern ]]; then
+            [[ "$PR_AUTHOR" == "$expected_app_bot" && "$PR_AUTHOR_TYPE" == 'Bot' ]] || fail 'CloudOps remediation must be authored by the configured GitHub App'
+            (( ${#changed_paths[@]} == 1 )) || fail 'CloudOps remediation must change exactly one file'
+            [[ "${changed_paths[0]}" == "$manifest_path" ]] || fail 'CloudOps remediation may change only the Deployment manifest'
+            [[ "${diff_items[0]}" == 'M' ]] || fail 'CloudOps remediation may not create or delete the Deployment manifest'
+            (( diff_bytes <= 131072 )) || fail 'CloudOps remediation diff exceeds 128 KiB'
+            printf 'mode=cloudops\n' >>"$GITHUB_OUTPUT"
+          elif [[ "$HEAD_REF" =~ $regression_branch_pattern ]]; then
+            require_reviewable_author
+            (( ${#changed_paths[@]} == 1 )) || fail 'regression injection must change exactly one file'
+            [[ "${changed_paths[0]}" == "$manifest_path" && "${diff_items[0]}" == 'M' ]] || fail 'regression injection may only modify the Deployment manifest'
+            printf 'mode=regression\n' >>"$GITHUB_OUTPUT"
+          elif [[ "$HEAD_REF" == 'bootstrap/demo-manifests' ]]; then
+            require_reviewable_author
+            require_only_app_paths
+            (( ${#changed_paths[@]} == 5 )) || fail 'Demo bootstrap must add the exact five-file inventory'
+            if git ls-tree -r --name-only "$BASE_SHA" -- apps/demo | grep -q .; then
+              fail 'Demo bootstrap requires an empty apps/demo base tree'
+            fi
+            for index in 0 2 4 6 8; do
+              [[ "${diff_items[index]}" == 'A' ]] || fail 'Demo bootstrap may only add files'
+            done
+            for expected in \
+              apps/demo/deployment.yaml \
+              apps/demo/diagnostics-service.yaml \
+              apps/demo/podmonitor.yaml \
+              apps/demo/prometheusrule.yaml \
+              apps/demo/service.yaml; do
+              contains_changed_path "$expected" || fail "Demo bootstrap is missing $expected"
+            done
+            printf 'mode=demo-bootstrap\n' >>"$GITHUB_OUTPUT"
+          elif [[ "$HEAD_REF" =~ $maintenance_branch_pattern ]]; then
+            require_reviewable_author
+            require_only_app_paths
+            for ((index = 0; index < ${#diff_items[@]}; index += 2)); do
+              [[ "${diff_items[index]}" == 'M' ]] || fail 'maintenance may modify, but not add or delete, fixed inventory files'
+            done
+            printf 'mode=maintenance\n' >>"$GITHUB_OUTPUT"
+          else
+            fail 'head branch is outside the approved workflow modes'
+          fi
+          printf 'base_sha=%s\n' "$BASE_SHA" >>"$GITHUB_OUTPUT"
+
+      - name: Validate bounded Kubernetes YAML
+        if: steps.policy.outputs.mode != 'bootstrap'
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.policy.outputs.base_sha }}
+          POLICY_MODE: ${{ steps.policy.outputs.mode }}
+        run: |
+          set -Eeuo pipefail
+
+          ruby <<'RUBY'
+          require 'open3'
+          require 'psych'
+          require 'set'
+
+          MANIFEST_PATH = 'apps/demo/deployment.yaml'
+          MAX_BYTES = 65_536
+          MAX_AST_NODES = 20_000
+          ALLOWED_API_VERSIONS = {
+            'Deployment' => 'apps/v1',
+            'Service' => 'v1',
+            'PodMonitor' => 'monitoring.coreos.com/v1',
+            'PrometheusRule' => 'monitoring.coreos.com/v1'
+          }.freeze
+          FIXED_NAMESPACE = 'demo'
+          INVENTORY = {
+            'apps/demo/deployment.yaml' => ['Deployment', 'demo'],
+            'apps/demo/diagnostics-service.yaml' => ['Service', 'demo-diagnostics'],
+            'apps/demo/podmonitor.yaml' => ['PodMonitor', 'demo'],
+            'apps/demo/prometheusrule.yaml' => ['PrometheusRule', 'demo'],
+            'apps/demo/service.yaml' => ['Service', 'demo']
+          }.freeze
+          REQUIRED_DOWNWARD_ENV = {
+            'K8S_NAMESPACE' => 'metadata.namespace',
+            'K8S_POD_NAME' => 'metadata.name',
+            'K8S_POD_UID' => 'metadata.uid'
+          }.freeze
+          DNS_LABEL = /\A[a-z0-9](?:[-a-z0-9]*[a-z0-9])?\z/
+
+          def fail_policy(message)
+            warn "manifest policy violation: #{message}"
+            exit 1
+          end
+
+          def scalar_map!(value, label)
+            fail_policy("#{label} must be a mapping") unless value.is_a?(Hash)
+            value.each do |key, item|
+              fail_policy("#{label} keys must be strings") unless key.is_a?(String)
+              fail_policy("#{label}.#{key} must be a string") unless item.is_a?(String)
+              fail_policy("#{label}.#{key} is too large") if item.bytesize > 512
+            end
+          end
+
+          def inspect_ast!(node, path, counter)
+            counter[0] += 1
+            fail_policy("#{path} exceeds the YAML complexity limit") if counter[0] > MAX_AST_NODES
+            fail_policy("#{path} contains a YAML alias") if node.is_a?(Psych::Nodes::Alias)
+            fail_policy("#{path} contains a YAML anchor") if node.respond_to?(:anchor) && node.anchor
+            fail_policy("#{path} contains an explicit YAML tag") if node.respond_to?(:tag) && node.tag
+
+            if node.is_a?(Psych::Nodes::Mapping)
+              fail_policy("#{path} has an invalid mapping") unless node.children.length.even?
+              keys = Set.new
+              node.children.each_slice(2) do |key_node, value_node|
+                fail_policy("#{path} contains a non-scalar mapping key") unless key_node.is_a?(Psych::Nodes::Scalar)
+                key = key_node.value
+                fail_policy("#{path} contains a YAML merge key") if key == '<<'
+                fail_policy("#{path} contains duplicate key #{key.inspect}") unless keys.add?(key)
+                inspect_ast!(key_node, path, counter)
+                inspect_ast!(value_node, path, counter)
+              end
+            elsif node.respond_to?(:children) && node.children
+              node.children.each { |child| inspect_ast!(child, path, counter) }
+            end
+          end
+
+          def load_document!(text, path)
+            fail_policy("#{path} exceeds 64 KiB") if text.bytesize > MAX_BYTES
+            fail_policy("#{path} contains a NUL byte") if text.include?("\0")
+
+            stream = Psych.parse_stream(text, filename: path)
+            fail_policy("#{path} must contain exactly one YAML document") unless stream.children.length == 1
+            document = stream.children.first
+            fail_policy("#{path} has an empty YAML document") unless document.root
+            inspect_ast!(document.root, path, [0])
+
+            object = Psych.safe_load(text, permitted_classes: [], permitted_symbols: [], aliases: false, filename: path)
+            fail_policy("#{path} root must be a mapping") unless object.is_a?(Hash)
+            object
+          rescue Psych::Exception => error
+            fail_policy("#{path} is invalid YAML: #{error.message}")
+          end
+
+          def walk!(value, path = '$', depth = 0, &block)
+            fail_policy("#{path} exceeds the nesting limit") if depth > 40
+            case value
+            when Hash
+              value.each do |key, item|
+                fail_policy("#{path} contains a non-string key") unless key.is_a?(String)
+                yield(key, item, path)
+                walk!(item, "#{path}.#{key}", depth + 1, &block)
+              end
+            when Array
+              value.each_with_index { |item, index| walk!(item, "#{path}[#{index}]", depth + 1, &block) }
+            when String
+              fail_policy("#{path} contains an oversized scalar") if value.bytesize > 16_384
+            when Integer, Float, TrueClass, FalseClass, NilClass
+              fail_policy("#{path} contains a non-finite number") if value.is_a?(Float) && !value.finite?
+            else
+              fail_policy("#{path} contains an unsupported YAML type")
+            end
+          end
+
+          def validate_metadata!(metadata, path, expected_name)
+            fail_policy("#{path} metadata must be a mapping") unless metadata.is_a?(Hash)
+            extra = metadata.keys - %w[name namespace labels annotations]
+            fail_policy("#{path} metadata contains denied fields: #{extra.join(', ')}") unless extra.empty?
+
+            name = metadata['name']
+            namespace = metadata['namespace']
+            fail_policy("#{path} metadata.name is invalid") unless name.is_a?(String) && name.bytesize <= 63 && DNS_LABEL.match?(name)
+            fail_policy("#{path} metadata.namespace is invalid") unless namespace.is_a?(String) && namespace.bytesize <= 63 && DNS_LABEL.match?(namespace)
+            fail_policy("#{path} metadata.name must be #{expected_name}") unless name == expected_name
+            fail_policy("#{path} metadata.namespace must be #{FIXED_NAMESPACE}") unless namespace == FIXED_NAMESPACE
+            scalar_map!(metadata['labels'], "#{path} metadata.labels") if metadata.key?('labels')
+            scalar_map!(metadata['annotations'], "#{path} metadata.annotations") if metadata.key?('annotations')
+
+            annotations = metadata.fetch('annotations', {})
+            annotations.each_key do |key|
+              fail_policy("#{path} contains a denied deployment hook annotation") if key.start_with?('argocd.argoproj.io/hook', 'helm.sh/hook')
+            end
+          end
+
+          def deployment_container!(object, path)
+            spec = object['spec']
+            fail_policy("#{path} Deployment spec must be a mapping") unless spec.is_a?(Hash)
+            template = spec['template']
+            pod_spec = template.is_a?(Hash) ? template['spec'] : nil
+            fail_policy("#{path} Deployment pod spec must be a mapping") unless pod_spec.is_a?(Hash)
+            containers = pod_spec['containers']
+            fail_policy("#{path} Deployment must contain exactly one container") unless containers.is_a?(Array) && containers.length == 1
+            container = containers.first
+            fail_policy("#{path} Deployment container must be a mapping") unless container.is_a?(Hash)
+            container
+          end
+
+          def validate_security_contexts!(pod_spec, container, path)
+            fail_policy("#{path} automountServiceAccountToken must be false") unless pod_spec['automountServiceAccountToken'] == false
+
+            context = pod_spec['securityContext']
+            fail_policy("#{path} pod securityContext must be a mapping") unless context.is_a?(Hash)
+            allowed = %w[fsGroup runAsGroup runAsNonRoot runAsUser seccompProfile]
+            fail_policy("#{path} pod securityContext has denied fields") unless (context.keys - allowed).empty?
+            fail_policy("#{path} pod runAsNonRoot must be true") unless context['runAsNonRoot'] == true
+            %w[fsGroup runAsGroup runAsUser].each do |key|
+              next unless context.key?(key)
+              fail_policy("#{path} pod #{key} must be a positive integer") unless context[key].is_a?(Integer) && context[key].positive?
+            end
+            fail_policy("#{path} pod seccompProfile must be RuntimeDefault") unless context['seccompProfile'] == { 'type' => 'RuntimeDefault' }
+
+            context = container['securityContext']
+            fail_policy("#{path} container securityContext must be a mapping") unless context.is_a?(Hash)
+            allowed = %w[allowPrivilegeEscalation capabilities readOnlyRootFilesystem runAsGroup runAsNonRoot runAsUser seccompProfile]
+            fail_policy("#{path} container securityContext has denied fields") unless (context.keys - allowed).empty?
+            fail_policy("#{path} allowPrivilegeEscalation must be false") unless context['allowPrivilegeEscalation'] == false
+            fail_policy("#{path} readOnlyRootFilesystem must be true") unless context['readOnlyRootFilesystem'] == true
+            fail_policy("#{path} container runAsNonRoot must be true") unless context['runAsNonRoot'] == true
+            %w[runAsGroup runAsUser].each do |key|
+              next unless context.key?(key)
+              fail_policy("#{path} container #{key} must be a positive integer") unless context[key].is_a?(Integer) && context[key].positive?
+            end
+            fail_policy("#{path} container seccompProfile must be RuntimeDefault") unless context['seccompProfile'] == { 'type' => 'RuntimeDefault' }
+            fail_policy("#{path} container capabilities must drop ALL") unless context['capabilities'] == { 'drop' => ['ALL'] }
+          end
+
+          def validate_deployment!(object, path)
+            container = deployment_container!(object, path)
+            fail_policy("#{path} Deployment must run exactly two replicas") unless object.dig('spec', 'replicas') == 2
+            fail_policy("#{path} Deployment container.name must be demo") unless container['name'] == 'demo'
+            image = container['image']
+            fail_policy("#{path} Deployment container.image must be an immutable digest") unless image.is_a?(String) && image.match?(/\A[a-z0-9._:\/-]+@sha256:[0-9a-f]{64}\z/)
+
+            pod_spec = object.dig('spec', 'template', 'spec')
+            validate_security_contexts!(pod_spec, container, path)
+
+            selector = { 'app.kubernetes.io/name' => 'demo' }
+            fail_policy("#{path} Deployment selector must be fixed") unless object.dig('spec', 'selector') == { 'matchLabels' => selector }
+            template_labels = object.dig('spec', 'template', 'metadata', 'labels')
+            fail_policy("#{path} Deployment pod labels must match the fixed selector") unless template_labels.is_a?(Hash) && selector.all? { |key, value| template_labels[key] == value }
+
+            volumes = pod_spec.fetch('volumes', [])
+            fail_policy("#{path} Deployment volumes must be an array") unless volumes.is_a?(Array)
+            volume_names = Set.new
+            volumes.each do |volume|
+              fail_policy("#{path} Deployment volume must be a mapping") unless volume.is_a?(Hash)
+              name = volume['name']
+              fail_policy("#{path} Deployment volume names must be DNS labels") unless name.is_a?(String) && DNS_LABEL.match?(name)
+              fail_policy("#{path} Deployment volume names must be unique") unless volume_names.add?(name)
+              fail_policy("#{path} only emptyDir volumes are allowed") unless volume.keys.sort == %w[emptyDir name]
+              fail_policy("#{path} emptyDir volume must use an empty mapping") unless volume['emptyDir'] == {}
+            end
+            mounts = container.fetch('volumeMounts', [])
+            fail_policy("#{path} volumeMounts must be an array") unless mounts.is_a?(Array)
+            mounts.each do |mount|
+              fail_policy("#{path} volumeMount must be a mapping") unless mount.is_a?(Hash)
+              fail_policy("#{path} volumeMount contains denied fields") unless (mount.keys - %w[mountPath name readOnly]).empty?
+              fail_policy("#{path} volumeMount may only mount /tmp") unless mount['mountPath'] == '/tmp' && mount['name'] == 'tmp'
+              fail_policy("#{path} /tmp volumeMount must be writable") if mount['readOnly'] == true
+            end
+            if mounts.any?
+              fail_policy("#{path} /tmp volume must be declared") unless volumes.any? { |volume| volume['name'] == 'tmp' }
+            end
+
+            env = container.fetch('env', [])
+            fail_policy("#{path} Deployment env must be an array") unless env.is_a?(Array)
+            names = Set.new
+            env.each_with_index do |entry, index|
+              fail_policy("#{path} env[#{index}] must be a mapping") unless entry.is_a?(Hash)
+              name = entry['name']
+              fail_policy("#{path} env[#{index}].name is invalid") unless name.is_a?(String) && name.match?(/\A[A-Z_][A-Z0-9_]{0,127}\z/)
+              fail_policy("#{path} has duplicate env name #{name}") unless names.add?(name)
+
+              if entry.key?('value')
+                fail_policy("#{path} env #{name} must contain only name and value") unless entry.keys.sort == %w[name value]
+                value = entry['value']
+                fail_policy("#{path} env #{name} must be a bounded literal string") unless value.is_a?(String) && !value.empty? && value.bytesize <= 512 && !value.match?(/[\0\r\n]/)
+              else
+                expected_field = REQUIRED_DOWNWARD_ENV[name]
+                fail_policy("#{path} env #{name} may not use valueFrom") unless expected_field && entry.keys.sort == %w[name valueFrom]
+                expected_source = { 'fieldRef' => { 'apiVersion' => 'v1', 'fieldPath' => expected_field } }
+                fail_policy("#{path} env #{name} has an unapproved fieldRef") unless entry['valueFrom'] == expected_source
+              end
+            end
+
+            REQUIRED_DOWNWARD_ENV.each do |name, field_path|
+              entry = env.find { |item| item['name'] == name }
+              expected_source = { 'fieldRef' => { 'apiVersion' => 'v1', 'fieldPath' => field_path } }
+              fail_policy("#{path} must inject #{name} through the Downward API") unless entry == { 'name' => name, 'valueFrom' => expected_source }
+            end
+          end
+
+          def validate_service!(object, path)
+            spec = object['spec']
+            fail_policy("#{path} Service spec must be a mapping") unless spec.is_a?(Hash)
+            service_type = spec.fetch('type', 'ClusterIP')
+            fail_policy("#{path} Service must be ClusterIP") unless service_type == 'ClusterIP'
+            fail_policy("#{path} Service selector must target only demo") unless spec['selector'] == { 'app.kubernetes.io/name' => 'demo' }
+            denied = %w[externalName externalIPs loadBalancerIP loadBalancerSourceRanges healthCheckNodePort]
+            present = denied.select { |key| spec.key?(key) }
+            fail_policy("#{path} Service contains denied fields: #{present.join(', ')}") unless present.empty?
+            Array(spec['ports']).each do |port|
+              fail_policy("#{path} Service ports must be mappings") unless port.is_a?(Hash)
+              fail_policy("#{path} Service may not allocate nodePort") if port.key?('nodePort')
+            end
+            diagnostics = object.dig('metadata', 'name') == 'demo-diagnostics'
+            if diagnostics
+              fail_policy("#{path} diagnostics Service must publish not-ready addresses") unless spec['publishNotReadyAddresses'] == true
+            else
+              fail_policy("#{path} normal Service may not publish not-ready addresses") if spec['publishNotReadyAddresses'] == true
+            end
+          end
+
+          def validate_object!(object, path, inventory_path = path)
+            extra = object.keys - %w[apiVersion kind metadata spec]
+            fail_policy("#{path} contains denied top-level fields: #{extra.join(', ')}") unless extra.empty?
+
+            expected = INVENTORY[inventory_path]
+            fail_policy("#{path} is outside the fixed rendered inventory") unless expected
+            expected_kind, expected_name = expected
+            kind = object['kind']
+            expected_api_version = ALLOWED_API_VERSIONS[kind]
+            fail_policy("#{path} kind is not allowed: #{kind.inspect}") unless expected_api_version
+            fail_policy("#{path} kind must be #{expected_kind}") unless kind == expected_kind
+            fail_policy("#{path} apiVersion must be #{expected_api_version}") unless object['apiVersion'] == expected_api_version
+            validate_metadata!(object['metadata'], path, expected_name)
+            fail_policy("#{path} spec must be a mapping") unless object['spec'].is_a?(Hash)
+
+            denied_keys = %w[
+              ephemeralContainers envFrom
+              hostIPC hostNetwork hostPID hostPath hostPort initContainers privileged
+              imagePullSecrets secret imagePullSecret secretKeyRef secretRef serviceAccountName
+              persistentVolumeClaim projected configMapKeyRef configMapRef downwardAPI serviceAccountToken
+            ].to_set
+            walk!(object) do |key, _value, location|
+              fail_policy("#{path} contains denied field #{key} at #{location}") if denied_keys.include?(key)
+            end
+
+            case kind
+            when 'Deployment'
+              validate_deployment!(object, path)
+            when 'Service'
+              validate_service!(object, path)
+            when 'PodMonitor'
+              labels = object.fetch('metadata').fetch('labels', {})
+              fail_policy("#{path} must opt in to the fixed monitoring selector") unless labels['cloudops.io/monitoring'] == 'enabled'
+              expected_selector = { 'matchLabels' => { 'app.kubernetes.io/name' => 'demo' } }
+              fail_policy("#{path} PodMonitor selector must target only demo") unless object.dig('spec', 'selector') == expected_selector
+              namespace_selector = object.dig('spec', 'namespaceSelector')
+              unless namespace_selector.nil?
+                expected_namespace = { 'matchNames' => [FIXED_NAMESPACE] }
+                fail_policy("#{path} PodMonitor namespaceSelector must remain in demo") unless namespace_selector == expected_namespace
+              end
+            when 'PrometheusRule'
+              labels = object.fetch('metadata').fetch('labels', {})
+              fail_policy("#{path} must opt in to the fixed monitoring selector") unless labels['cloudops.io/monitoring'] == 'enabled'
+            end
+            object
+          end
+
+          def required_env_entries(object, path)
+            deployment_container!(object, path).fetch('env', []).select { |item| item['name'] == 'REQUIRED_ENV' }
+          end
+
+          def remove_required_env!(object, path)
+            container = deployment_container!(object, path)
+            return unless container.key?('env')
+            container['env'] = container['env'].reject { |item| item['name'] == 'REQUIRED_ENV' }
+            container.delete('env') if container['env'].empty?
+          end
+
+          def read_git_blob!(revision, path)
+            stdout, stderr, status = Open3.capture3('git', 'show', "#{revision}:#{path}")
+            fail_policy("cannot read #{path} at #{revision}: #{stderr.strip}") unless status.success?
+            stdout
+          end
+
+          tracked, stderr, status = Open3.capture3('git', 'ls-files', '-z', '--', 'apps/demo')
+          fail_policy("cannot enumerate GitOps manifests: #{stderr.strip}") unless status.success?
+          paths = tracked.split("\0").reject(&:empty?)
+          fail_policy('apps/demo inventory is incomplete or contains extra paths') unless paths.sort == INVENTORY.keys.sort
+          objects = {}
+          paths.each do |path|
+            fail_policy("unsupported file under apps/demo: #{path}") unless path.match?(/\.(?:yaml|yml)\z/)
+            objects[path] = validate_object!(load_document!(File.binread(path), path), path)
+          end
+
+          mode = ENV.fetch('POLICY_MODE')
+          head = objects.fetch(MANIFEST_PATH)
+
+          if %w[demo-bootstrap maintenance tree].include?(mode)
+            fail_policy("#{mode} requires exactly one REQUIRED_ENV literal") unless required_env_entries(head, MANIFEST_PATH).length == 1
+          elsif %w[cloudops regression].include?(mode)
+            base_sha = ENV.fetch('BASE_SHA')
+            fail_policy("#{mode} validation requires a base SHA") unless base_sha.match?(/\A[0-9a-f]{40}\z/)
+            base = validate_object!(load_document!(read_git_blob!(base_sha, MANIFEST_PATH), "#{MANIFEST_PATH}@base"), "#{MANIFEST_PATH}@base", MANIFEST_PATH)
+            base_required = required_env_entries(base, "#{MANIFEST_PATH}@base")
+            head_required = required_env_entries(head, "#{MANIFEST_PATH}@head")
+
+            if mode == 'cloudops'
+              fail_policy('CloudOps base must be missing REQUIRED_ENV') unless base_required.empty?
+              fail_policy('CloudOps head must restore exactly one REQUIRED_ENV literal') unless head_required.length == 1
+            else
+              fail_policy('regression base must contain exactly one REQUIRED_ENV literal') unless base_required.length == 1
+              fail_policy('regression head must remove REQUIRED_ENV') unless head_required.empty?
+            end
+
+            remove_required_env!(base, "#{MANIFEST_PATH}@base")
+            remove_required_env!(head, "#{MANIFEST_PATH}@head")
+            fail_policy("#{mode} changes fields other than REQUIRED_ENV") unless base == head
+          else
+            fail_policy("unsupported manifest validation mode: #{mode}")
+          end
+
+          puts "validated #{paths.length} bounded GitOps manifest(s) in #{mode} mode"
+          RUBY
