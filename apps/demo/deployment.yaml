@@ -45,6 +45,8 @@ spec:
               drop:
                 - ALL
           env:
+            - name: REQUIRED_ENV
+              value: baseline-present
             - name: SERVICE_VERSION
               value: e52ddaf4a3376c246654b02cda9cc08d70e3515f
             - name: SOURCE_REVISION
