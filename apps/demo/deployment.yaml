@@ -33,7 +33,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: demo
-          image: ghcr.io/05allan1213/cloudops-demo@sha256:9fbe2ed7246df47aac7d1c3ffd638f827d8920c7e5a78c0929c8f94d09398c69
+          image: ghcr.io/05allan1213/cloudops-demo@sha256:233f22075cb42033ca25e8898655a6a028ca088d7e9d3391533dd29f585d65a0
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
@@ -45,10 +45,12 @@ spec:
               drop:
                 - ALL
           env:
+            - name: REQUIRED_ENV
+              value: baseline-present
             - name: SERVICE_VERSION
-              value: e2bc55d49deee1c6ba67dfb1ec873befda6a08f5
+              value: d25f4c9e251f2c4c08917b12bf97174a7df48bd1
             - name: SOURCE_REVISION
-              value: e2bc55d49deee1c6ba67dfb1ec873befda6a08f5
+              value: d25f4c9e251f2c4c08917b12bf97174a7df48bd1
             - name: DEPLOYMENT_ENVIRONMENT
               value: local-demo
             - name: K8S_CLUSTER_NAME
