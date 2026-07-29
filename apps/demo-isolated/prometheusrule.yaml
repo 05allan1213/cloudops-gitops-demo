@@ -1,0 +1,41 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: demo-isolated
+  namespace: demo-isolated
+  labels:
+    app.kubernetes.io/name: demo-isolated
+    cloudops.io/monitoring: enabled
+    cloudops.io/signal-target: demo-isolated
+spec:
+  groups:
+    - name: cloudops.v3.demo-isolated
+      rules:
+        - alert: CloudOpsDemoIsolatedRequiredEnvMissing
+          expr: min(cloudops_demo_workload_ready{namespace="demo-isolated"}) < 1
+          for: 30s
+          labels:
+            severity: critical
+            signal_target: demo-isolated
+            cluster: cloudops-v3-final
+            environment: local-demo-isolated
+            namespace: demo-isolated
+            service: demo-isolated
+            deployment: demo-isolated
+          annotations:
+            summary: Isolated demo workload is missing REQUIRED_ENV
+            description: At least one active isolated demo replica is not ready because the required GitOps environment node is absent.
+        - alert: CloudOpsDemoIsolatedErrorRateHigh
+          expr: sum(rate(cloudops_demo_http_errors_total{namespace="demo-isolated",route="/"}[1m])) / clamp_min(sum(rate(cloudops_demo_http_requests_total{namespace="demo-isolated",route="/"}[1m])), 0.001) > 0.20
+          for: 30s
+          labels:
+            severity: critical
+            signal_target: demo-isolated
+            cluster: cloudops-v3-final
+            environment: local-demo-isolated
+            namespace: demo-isolated
+            service: demo-isolated
+            deployment: demo-isolated
+          annotations:
+            summary: Isolated demo workload request error rate is high
+            description: Bounded diagnostics traffic is observing controlled server errors from the isolated demo workload.
