@@ -45,8 +45,6 @@ spec:
               drop:
                 - ALL
           env:
-            - name: REQUIRED_ENV
-              value: healthy
             - name: SERVICE_NAME
               value: demo
             - name: SERVICE_VERSION
