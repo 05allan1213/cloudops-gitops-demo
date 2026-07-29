@@ -47,6 +47,8 @@ spec:
           env:
             - name: REQUIRED_ENV
               value: healthy
+            - name: SERVICE_NAME
+              value: demo
             - name: SERVICE_VERSION
               value: c9e5e35ddb1ecfd892fcc1e1adb6cf8696196ee9
             - name: SOURCE_REVISION
