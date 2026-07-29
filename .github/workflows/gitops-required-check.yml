@@ -52,11 +52,14 @@ jobs:
           IFS=$'\n\t'
 
           readonly manifest_path='apps/demo/deployment.yaml'
+          readonly isolated_manifest_path='apps/demo-isolated/deployment.yaml'
           readonly workflow_path='.github/workflows/gitops-required-check.yml'
           readonly expected_app_bot='cloudops-incident-agent-v3[bot]'
           readonly cloudops_branch_pattern='^cloudops/incident-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/plan-[0-9a-f]{12,64}$'
           readonly maintenance_branch_pattern='^maintenance/demo-[a-z0-9][a-z0-9-]{0,40}$'
+          readonly isolated_maintenance_branch_pattern='^maintenance/demo-isolated-[a-z0-9][a-z0-9-]{0,40}$'
           readonly regression_branch_pattern='^regression/required-env-[a-z0-9][a-z0-9-]{0,40}$'
+          readonly isolated_regression_branch_pattern='^regression/required-env-isolated-[a-z0-9][a-z0-9-]{0,40}$'
 
           fail() {
             printf 'policy violation: %s\n' "$*" >&2
@@ -83,7 +86,7 @@ jobs:
             (( ${#tracked_paths[@]} <= 18 )) || fail 'repository contains too many tracked files'
             for path in "${tracked_paths[@]}"; do
               case "$path" in
-                README.md|"$workflow_path"|apps/demo/*.yaml|apps/demo/*.yml)
+                README.md|"$workflow_path"|apps/demo/*.yaml|apps/demo/*.yml|apps/demo-isolated/*.yaml|apps/demo-isolated/*.yml)
                   inspect_head_path "$path"
                   ;;
                 *)
@@ -101,9 +104,9 @@ jobs:
           }
 
           require_only_app_paths() {
-            local path
+            local target_dir=$1 path
             for path in "${changed_paths[@]}"; do
-              [[ "$path" == apps/demo/*.yaml || "$path" == apps/demo/*.yml ]] || fail "branch may change only apps/demo YAML: $path"
+              [[ "$path" == "$target_dir/"*.yaml || "$path" == "$target_dir/"*.yml ]] || fail "branch may change only $target_dir YAML: $path"
             done
           }
 
@@ -115,6 +118,25 @@ jobs:
             return 1
           }
 
+          changed_status() {
+            local expected=$1 index
+            for ((index = 0; index < ${#diff_items[@]}; index += 2)); do
+              if [[ "${diff_items[index + 1]}" == "$expected" ]]; then
+                printf '%s' "${diff_items[index]}"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          target_for_manifest() {
+            case "$1" in
+              "$manifest_path") printf 'demo' ;;
+              "$isolated_manifest_path") printf 'demo-isolated' ;;
+              *) return 1 ;;
+            esac
+          }
+
           if [[ "$EVENT_NAME" == 'workflow_dispatch' ]]; then
             [[ "$WORKFLOW_REF" == 'refs/heads/main' ]] || fail 'manual validation is allowed only on main'
             validate_head_tree
@@ -124,14 +146,20 @@ jobs:
               [[ ${#bootstrap_paths[@]} -eq 2 ]] || fail 'manifest-less bootstrap tree must contain exactly two files'
               [[ "${bootstrap_paths[0]}" == "$workflow_path" ]] || fail 'bootstrap tree is missing the fixed workflow'
               [[ "${bootstrap_paths[1]}" == 'README.md' ]] || fail 'bootstrap tree is missing README.md'
-              printf 'mode=bootstrap\n' >>"$GITHUB_OUTPUT"
-              printf 'base_sha=\n' >>"$GITHUB_OUTPUT"
+              {
+                printf 'mode=bootstrap\n'
+                printf 'base_sha=\n'
+                printf 'target=\n'
+              } >>"$GITHUB_OUTPUT"
               exit 0
             fi
 
             [[ -f "$manifest_path" ]] || fail 'deployment manifest is not a regular file'
-            printf 'mode=tree\n' >>"$GITHUB_OUTPUT"
-            printf 'base_sha=\n' >>"$GITHUB_OUTPUT"
+            {
+              printf 'mode=tree\n'
+              printf 'base_sha=\n'
+              printf 'target=demo\n'
+            } >>"$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -157,7 +185,7 @@ jobs:
             [[ "$status" == 'A' || "$status" == 'M' ]] || fail "only added or modified files are allowed: $path"
             case "$path" in
               README.md|"$workflow_path") ;;
-              apps/demo/*.yaml|apps/demo/*.yml)
+              apps/demo/*.yaml|apps/demo/*.yml|apps/demo-isolated/*.yaml|apps/demo-isolated/*.yml)
                 ;;
               *)
                 fail "changed path is outside the GitOps allowlist: $path"
@@ -167,6 +195,7 @@ jobs:
             changed_paths+=("$path")
           done
 
+          policy_target=''
           if [[ "$HEAD_REF" == 'codex/bootstrap-required-check' ]]; then
             require_reviewable_author
             (( ${#changed_paths[@]} == 1 )) || fail 'workflow bootstrap must change exactly one file'
@@ -178,18 +207,43 @@ jobs:
           elif [[ "$HEAD_REF" =~ $cloudops_branch_pattern ]]; then
             [[ "$PR_AUTHOR" == "$expected_app_bot" && "$PR_AUTHOR_TYPE" == 'Bot' ]] || fail 'CloudOps remediation must be authored by the configured GitHub App'
             (( ${#changed_paths[@]} == 1 )) || fail 'CloudOps remediation must change exactly one file'
-            [[ "${changed_paths[0]}" == "$manifest_path" ]] || fail 'CloudOps remediation may change only the Deployment manifest'
+            policy_target=$(target_for_manifest "${changed_paths[0]}") || fail 'CloudOps remediation may change only an approved Deployment manifest'
             [[ "${diff_items[0]}" == 'M' ]] || fail 'CloudOps remediation may not create or delete the Deployment manifest'
             (( diff_bytes <= 131072 )) || fail 'CloudOps remediation diff exceeds 128 KiB'
             printf 'mode=cloudops\n' >>"$GITHUB_OUTPUT"
+          elif [[ "$HEAD_REF" =~ $isolated_regression_branch_pattern ]]; then
+            require_reviewable_author
+            (( ${#changed_paths[@]} == 1 )) || fail 'regression injection must change exactly one file'
+            [[ "${changed_paths[0]}" == "$isolated_manifest_path" && "${diff_items[0]}" == 'M' ]] || fail 'isolated regression injection may only modify the isolated Deployment manifest'
+            policy_target='demo-isolated'
+            printf 'mode=regression\n' >>"$GITHUB_OUTPUT"
           elif [[ "$HEAD_REF" =~ $regression_branch_pattern ]]; then
             require_reviewable_author
             (( ${#changed_paths[@]} == 1 )) || fail 'regression injection must change exactly one file'
             [[ "${changed_paths[0]}" == "$manifest_path" && "${diff_items[0]}" == 'M' ]] || fail 'regression injection may only modify the Deployment manifest'
+            policy_target='demo'
             printf 'mode=regression\n' >>"$GITHUB_OUTPUT"
+          elif [[ "$HEAD_REF" == 'bootstrap/demo-isolated-manifests' ]]; then
+            require_reviewable_author
+            (( ${#changed_paths[@]} == 6 )) || fail 'Isolated demo bootstrap must update policy and add the exact five-file inventory'
+            [[ "$(changed_status "$workflow_path")" == 'M' ]] || fail 'Isolated demo bootstrap must update the fixed workflow'
+            if git ls-tree -r --name-only "$BASE_SHA" -- apps/demo-isolated | grep -q .; then
+              fail 'Isolated demo bootstrap requires an empty apps/demo-isolated base tree'
+            fi
+            for expected in \
+              apps/demo-isolated/deployment.yaml \
+              apps/demo-isolated/diagnostics-service.yaml \
+              apps/demo-isolated/podmonitor.yaml \
+              apps/demo-isolated/prometheusrule.yaml \
+              apps/demo-isolated/service.yaml; do
+              contains_changed_path "$expected" || fail "Isolated demo bootstrap is missing $expected"
+              [[ "$(changed_status "$expected")" == 'A' ]] || fail "Isolated demo bootstrap may only add $expected"
+            done
+            policy_target='demo-isolated'
+            printf 'mode=demo-isolated-bootstrap\n' >>"$GITHUB_OUTPUT"
           elif [[ "$HEAD_REF" == 'bootstrap/demo-manifests' ]]; then
             require_reviewable_author
-            require_only_app_paths
+            require_only_app_paths apps/demo
             (( ${#changed_paths[@]} == 5 )) || fail 'Demo bootstrap must add the exact five-file inventory'
             if git ls-tree -r --name-only "$BASE_SHA" -- apps/demo | grep -q .; then
               fail 'Demo bootstrap requires an empty apps/demo base tree'
@@ -205,18 +259,29 @@ jobs:
               apps/demo/service.yaml; do
               contains_changed_path "$expected" || fail "Demo bootstrap is missing $expected"
             done
+            policy_target='demo'
             printf 'mode=demo-bootstrap\n' >>"$GITHUB_OUTPUT"
-          elif [[ "$HEAD_REF" =~ $maintenance_branch_pattern ]]; then
+          elif [[ "$HEAD_REF" =~ $isolated_maintenance_branch_pattern ]]; then
             require_reviewable_author
-            require_only_app_paths
+            require_only_app_paths apps/demo-isolated
             for ((index = 0; index < ${#diff_items[@]}; index += 2)); do
               [[ "${diff_items[index]}" == 'M' ]] || fail 'maintenance may modify, but not add or delete, fixed inventory files'
             done
+            policy_target='demo-isolated'
+            printf 'mode=maintenance\n' >>"$GITHUB_OUTPUT"
+          elif [[ "$HEAD_REF" =~ $maintenance_branch_pattern ]]; then
+            require_reviewable_author
+            require_only_app_paths apps/demo
+            for ((index = 0; index < ${#diff_items[@]}; index += 2)); do
+              [[ "${diff_items[index]}" == 'M' ]] || fail 'maintenance may modify, but not add or delete, fixed inventory files'
+            done
+            policy_target='demo'
             printf 'mode=maintenance\n' >>"$GITHUB_OUTPUT"
           else
             fail 'head branch is outside the approved workflow modes'
           fi
           printf 'base_sha=%s\n' "$BASE_SHA" >>"$GITHUB_OUTPUT"
+          printf 'target=%s\n' "$policy_target" >>"$GITHUB_OUTPUT"
 
       - name: Validate bounded Kubernetes YAML
         if: steps.policy.outputs.mode != 'bootstrap'
@@ -224,6 +289,7 @@ jobs:
         env:
           BASE_SHA: ${{ steps.policy.outputs.base_sha }}
           POLICY_MODE: ${{ steps.policy.outputs.mode }}
+          POLICY_TARGET: ${{ steps.policy.outputs.target }}
         run: |
           set -Eeuo pipefail
 
@@ -232,7 +298,6 @@ jobs:
           require 'psych'
           require 'set'
 
-          MANIFEST_PATH = 'apps/demo/deployment.yaml'
           MAX_BYTES = 65_536
           MAX_AST_NODES = 20_000
           ALLOWED_API_VERSIONS = {
@@ -241,14 +306,41 @@ jobs:
             'PodMonitor' => 'monitoring.coreos.com/v1',
             'PrometheusRule' => 'monitoring.coreos.com/v1'
           }.freeze
-          FIXED_NAMESPACE = 'demo'
-          INVENTORY = {
-            'apps/demo/deployment.yaml' => ['Deployment', 'demo'],
-            'apps/demo/diagnostics-service.yaml' => ['Service', 'demo-diagnostics'],
-            'apps/demo/podmonitor.yaml' => ['PodMonitor', 'demo'],
-            'apps/demo/prometheusrule.yaml' => ['PrometheusRule', 'demo'],
-            'apps/demo/service.yaml' => ['Service', 'demo']
+          TARGETS = {
+            'demo' => {
+              'app_dir' => 'apps/demo',
+              'resource_name' => 'demo',
+              'namespace' => 'demo',
+              'deployment_path' => 'apps/demo/deployment.yaml',
+              'inventory' => {
+                'apps/demo/deployment.yaml' => ['Deployment', 'demo'],
+                'apps/demo/diagnostics-service.yaml' => ['Service', 'demo-diagnostics'],
+                'apps/demo/podmonitor.yaml' => ['PodMonitor', 'demo'],
+                'apps/demo/prometheusrule.yaml' => ['PrometheusRule', 'demo'],
+                'apps/demo/service.yaml' => ['Service', 'demo']
+              }
+            },
+            'demo-isolated' => {
+              'app_dir' => 'apps/demo-isolated',
+              'resource_name' => 'demo-isolated',
+              'namespace' => 'demo-isolated',
+              'deployment_path' => 'apps/demo-isolated/deployment.yaml',
+              'inventory' => {
+                'apps/demo-isolated/deployment.yaml' => ['Deployment', 'demo-isolated'],
+                'apps/demo-isolated/diagnostics-service.yaml' => ['Service', 'demo-isolated-diagnostics'],
+                'apps/demo-isolated/podmonitor.yaml' => ['PodMonitor', 'demo-isolated'],
+                'apps/demo-isolated/prometheusrule.yaml' => ['PrometheusRule', 'demo-isolated'],
+                'apps/demo-isolated/service.yaml' => ['Service', 'demo-isolated']
+              }
+            }
           }.freeze
+          TARGET = TARGETS.fetch(ENV.fetch('POLICY_TARGET')).freeze
+          APP_DIR = TARGET.fetch('app_dir')
+          FIXED_RESOURCE_NAME = TARGET.fetch('resource_name')
+          FIXED_NAMESPACE = TARGET.fetch('namespace')
+          MANIFEST_PATH = TARGET.fetch('deployment_path')
+          INVENTORY = TARGET.fetch('inventory').freeze
+          DIAGNOSTICS_NAME = "#{FIXED_RESOURCE_NAME}-diagnostics"
           REQUIRED_DOWNWARD_ENV = {
             'K8S_NAMESPACE' => 'metadata.namespace',
             'K8S_POD_NAME' => 'metadata.name',
@@ -395,14 +487,14 @@ jobs:
           def validate_deployment!(object, path)
             container = deployment_container!(object, path)
             fail_policy("#{path} Deployment must run exactly two replicas") unless object.dig('spec', 'replicas') == 2
-            fail_policy("#{path} Deployment container.name must be demo") unless container['name'] == 'demo'
+            fail_policy("#{path} Deployment container.name must be #{FIXED_RESOURCE_NAME}") unless container['name'] == FIXED_RESOURCE_NAME
             image = container['image']
             fail_policy("#{path} Deployment container.image must be an immutable digest") unless image.is_a?(String) && image.match?(/\A[a-z0-9._:\/-]+@sha256:[0-9a-f]{64}\z/)
 
             pod_spec = object.dig('spec', 'template', 'spec')
             validate_security_contexts!(pod_spec, container, path)
 
-            selector = { 'app.kubernetes.io/name' => 'demo' }
+            selector = { 'app.kubernetes.io/name' => FIXED_RESOURCE_NAME }
             fail_policy("#{path} Deployment selector must be fixed") unless object.dig('spec', 'selector') == { 'matchLabels' => selector }
             template_labels = object.dig('spec', 'template', 'metadata', 'labels')
             fail_policy("#{path} Deployment pod labels must match the fixed selector") unless template_labels.is_a?(Hash) && selector.all? { |key, value| template_labels[key] == value }
@@ -463,7 +555,7 @@ jobs:
             fail_policy("#{path} Service spec must be a mapping") unless spec.is_a?(Hash)
             service_type = spec.fetch('type', 'ClusterIP')
             fail_policy("#{path} Service must be ClusterIP") unless service_type == 'ClusterIP'
-            fail_policy("#{path} Service selector must target only demo") unless spec['selector'] == { 'app.kubernetes.io/name' => 'demo' }
+            fail_policy("#{path} Service selector must target only #{FIXED_RESOURCE_NAME}") unless spec['selector'] == { 'app.kubernetes.io/name' => FIXED_RESOURCE_NAME }
             denied = %w[externalName externalIPs loadBalancerIP loadBalancerSourceRanges healthCheckNodePort]
             present = denied.select { |key| spec.key?(key) }
             fail_policy("#{path} Service contains denied fields: #{present.join(', ')}") unless present.empty?
@@ -471,7 +563,7 @@ jobs:
               fail_policy("#{path} Service ports must be mappings") unless port.is_a?(Hash)
               fail_policy("#{path} Service may not allocate nodePort") if port.key?('nodePort')
             end
-            diagnostics = object.dig('metadata', 'name') == 'demo-diagnostics'
+            diagnostics = object.dig('metadata', 'name') == DIAGNOSTICS_NAME
             if diagnostics
               fail_policy("#{path} diagnostics Service must publish not-ready addresses") unless spec['publishNotReadyAddresses'] == true
             else
@@ -512,12 +604,12 @@ jobs:
             when 'PodMonitor'
               labels = object.fetch('metadata').fetch('labels', {})
               fail_policy("#{path} must opt in to the fixed monitoring selector") unless labels['cloudops.io/monitoring'] == 'enabled'
-              expected_selector = { 'matchLabels' => { 'app.kubernetes.io/name' => 'demo' } }
-              fail_policy("#{path} PodMonitor selector must target only demo") unless object.dig('spec', 'selector') == expected_selector
+              expected_selector = { 'matchLabels' => { 'app.kubernetes.io/name' => FIXED_RESOURCE_NAME } }
+              fail_policy("#{path} PodMonitor selector must target only #{FIXED_RESOURCE_NAME}") unless object.dig('spec', 'selector') == expected_selector
               namespace_selector = object.dig('spec', 'namespaceSelector')
               unless namespace_selector.nil?
                 expected_namespace = { 'matchNames' => [FIXED_NAMESPACE] }
-                fail_policy("#{path} PodMonitor namespaceSelector must remain in demo") unless namespace_selector == expected_namespace
+                fail_policy("#{path} PodMonitor namespaceSelector must remain in #{FIXED_NAMESPACE}") unless namespace_selector == expected_namespace
               end
             when 'PrometheusRule'
               labels = object.fetch('metadata').fetch('labels', {})
@@ -543,20 +635,20 @@ jobs:
             stdout
           end
 
-          tracked, stderr, status = Open3.capture3('git', 'ls-files', '-z', '--', 'apps/demo')
+          tracked, stderr, status = Open3.capture3('git', 'ls-files', '-z', '--', APP_DIR)
           fail_policy("cannot enumerate GitOps manifests: #{stderr.strip}") unless status.success?
           paths = tracked.split("\0").reject(&:empty?)
-          fail_policy('apps/demo inventory is incomplete or contains extra paths') unless paths.sort == INVENTORY.keys.sort
+          fail_policy("#{APP_DIR} inventory is incomplete or contains extra paths") unless paths.sort == INVENTORY.keys.sort
           objects = {}
           paths.each do |path|
-            fail_policy("unsupported file under apps/demo: #{path}") unless path.match?(/\.(?:yaml|yml)\z/)
+            fail_policy("unsupported file under #{APP_DIR}: #{path}") unless path.match?(/\.(?:yaml|yml)\z/)
             objects[path] = validate_object!(load_document!(File.binread(path), path), path)
           end
 
           mode = ENV.fetch('POLICY_MODE')
           head = objects.fetch(MANIFEST_PATH)
 
-          if %w[demo-bootstrap maintenance tree].include?(mode)
+          if %w[demo-bootstrap demo-isolated-bootstrap maintenance tree].include?(mode)
             fail_policy("#{mode} requires exactly one REQUIRED_ENV literal") unless required_env_entries(head, MANIFEST_PATH).length == 1
           elsif %w[cloudops regression].include?(mode)
             base_sha = ENV.fetch('BASE_SHA')
