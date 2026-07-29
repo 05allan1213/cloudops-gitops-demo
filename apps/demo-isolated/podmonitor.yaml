@@ -1,0 +1,22 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: demo-isolated
+  namespace: demo-isolated
+  labels:
+    app.kubernetes.io/name: demo-isolated
+    cloudops.io/monitoring: enabled
+    cloudops.io/signal-target: demo-isolated
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-isolated
+  namespaceSelector:
+    matchNames:
+      - demo-isolated
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 5s
+      honorLabels: false
